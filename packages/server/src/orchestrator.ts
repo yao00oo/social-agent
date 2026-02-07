@@ -6,6 +6,7 @@ import { ChannelGateway } from "./gateway/ChannelGateway";
 import { TaskStateManager } from "./state/TaskStateManager";
 import { TaskContext, UnifiedMessage, ContactInfo } from "./types";
 import { SocketManager } from "./socket";
+import { DemoSimulator } from "./demo/DemoSimulator";
 
 export class Orchestrator {
   constructor(
@@ -32,18 +33,27 @@ export class Orchestrator {
     // 3. Look up contacts mentioned in instruction
     const contacts = await this.resolveContacts(userId, instruction);
 
-    // 4. Plan the task
-    const plan = await this.planner.plan(
-      instruction,
-      userId,
-      contacts.map((c) => c.name)
-    );
+    // 4. Plan the task (demo mode uses scripted plans)
+    let steps;
+    if (DemoSimulator.isDemoMode()) {
+      console.log("[Demo] Using demo simulator for planning");
+      steps = DemoSimulator.generatePlan(instruction);
+    }
+
+    if (!steps) {
+      const plan = await this.planner.plan(
+        instruction,
+        userId,
+        contacts.map((c) => c.name)
+      );
+      steps = plan.steps;
+    }
 
     // 5. Store steps
-    await this.state.addSteps(task.id, plan.steps);
+    await this.state.addSteps(task.id, steps);
 
     // 6. Store contacts in task context
-    await this.state.updateTaskContext(task.id, { contacts });
+    await this.state.updateTaskContext(task.id, { contacts, instruction });
 
     // 7. Update status and start execution
     await this.state.updateTaskStatus(task.id, "executing");
@@ -67,8 +77,22 @@ export class Orchestrator {
       if (allDone) {
         await this.state.updateTaskStatus(taskId, "completed");
 
-        // Build completion summary
-        const summary = this.buildCompletionSummary(task);
+        const context = (task.context as Record<string, any>) || {};
+        let summary: Record<string, any>;
+
+        if (DemoSimulator.isDemoMode()) {
+          summary = DemoSimulator.getCompletionSummary(task.instruction, context);
+          summary.instruction = task.instruction;
+          summary.stepsCompleted = steps.filter((s) => s.status === "done").length;
+          summary.totalSteps = steps.length;
+          summary.results = steps
+            .filter((s) => s.status === "done" && s.result)
+            .map((s) => ({ description: s.description, result: s.result }));
+          summary.context = context;
+        } else {
+          summary = this.buildCompletionSummary(task);
+        }
+
         this.socketManager.emitTaskCompleted(taskId, summary);
       }
       return;
@@ -81,10 +105,7 @@ export class Orchestrator {
         const dep = steps.find((s) => s.id === depId);
         return dep && dep.status === "done";
       });
-      if (!allDepsDone) {
-        // Dependencies not met yet, skip for now
-        return;
-      }
+      if (!allDepsDone) return;
     }
 
     // Route decision
@@ -125,6 +146,13 @@ export class Orchestrator {
       type: nextStep.type as any,
     });
 
+    // --- Demo mode: simulate the step ---
+    if (DemoSimulator.isDemoMode()) {
+      await this.executeDemoStep(taskId, nextStep, task);
+      return;
+    }
+
+    // --- Real mode ---
     const stepData = {
       id: nextStep.id,
       type: nextStep.type as any,
@@ -140,7 +168,6 @@ export class Orchestrator {
     const execResult = await this.executor.startStep(stepData, context);
 
     if (execResult.message) {
-      // Record outbound message
       const outboundMsg: UnifiedMessage = {
         id: uuid(),
         taskId,
@@ -164,16 +191,137 @@ export class Orchestrator {
       await this.state.updateStepStatus(taskId, nextStep.id, "waiting_response");
       await this.state.updateTaskStatus(taskId, "waiting_reply");
     } else {
-      // Step completed synchronously
       await this.state.updateStepStatus(taskId, nextStep.id, "done", {
         status: "success",
         extracted: {},
         summary: nextStep.description,
       });
-
       this.socketManager.emitStepCompleted(taskId, nextStep.id, nextStep.description);
+      await this.executeNextStep(taskId);
+    }
+  }
 
-      // Continue to next step
+  /**
+   * Demo mode: simulate a step with delays to make it feel real.
+   */
+  private async executeDemoStep(taskId: string, nextStep: any, task: any) {
+    const instruction = task.instruction;
+
+    if (nextStep.type === "contact_outreach") {
+      // Generate and "send" outbound message
+      const outboundText = DemoSimulator.generateOutboundMessage(
+        { goal: nextStep.goal, target: nextStep.target, description: nextStep.description },
+        instruction,
+        true
+      );
+
+      // Simulate short send delay
+      await this.delay(800);
+
+      const outboundMsg: UnifiedMessage = {
+        id: uuid(),
+        taskId,
+        stepId: nextStep.id,
+        direction: "outbound",
+        channel: "sms",
+        from: "agent",
+        to: nextStep.target || "",
+        content: { type: "text", body: outboundText },
+        timestamp: new Date(),
+      };
+      await this.state.associateMessage(outboundMsg, taskId, nextStep.id);
+
+      this.socketManager.emitMessageSent(taskId, nextStep.id, {
+        message: outboundText,
+        to: nextStep.target || "",
+      });
+
+      // Check if there's a simulated reply
+      const simReply = DemoSimulator.getSimulatedReply(nextStep.description, instruction);
+
+      if (simReply) {
+        await this.state.updateStepStatus(taskId, nextStep.id, "waiting_response");
+        await this.state.updateTaskStatus(taskId, "waiting_reply");
+
+        // Schedule simulated reply after delay
+        setTimeout(async () => {
+          try {
+            const inboundMsg: UnifiedMessage = {
+              id: uuid(),
+              taskId,
+              stepId: nextStep.id,
+              direction: "inbound",
+              channel: "sms",
+              from: nextStep.target || "contact",
+              to: "agent",
+              content: { type: "text", body: simReply.reply },
+              timestamp: new Date(),
+            };
+            await this.state.associateMessage(inboundMsg, taskId, nextStep.id);
+
+            this.socketManager.emitReplyReceived(taskId, nextStep.id, {
+              from: nextStep.target || "联系人",
+              message: simReply.reply,
+            });
+
+            // Mark step as done
+            await this.state.updateStepStatus(taskId, nextStep.id, "done", {
+              status: "success",
+              extracted: { reply: simReply.reply },
+              summary: `${nextStep.target} 回复: ${simReply.reply}`,
+            });
+
+            this.socketManager.emitStepCompleted(
+              taskId,
+              nextStep.id,
+              `${nextStep.target} 回复: ${simReply.reply}`
+            );
+
+            await this.state.updateTaskStatus(taskId, "executing");
+            await this.executeNextStep(taskId);
+          } catch (err) {
+            console.error("[Demo] Simulated reply error:", err);
+          }
+        }, simReply.delay);
+      } else {
+        // No simulated reply, complete immediately
+        await this.state.updateStepStatus(taskId, nextStep.id, "done", {
+          status: "success",
+          extracted: {},
+          summary: nextStep.description,
+        });
+        this.socketManager.emitStepCompleted(taskId, nextStep.id, nextStep.description);
+        await this.executeNextStep(taskId);
+      }
+    } else if (nextStep.type === "info_retrieval") {
+      // Simulate info lookup
+      await this.delay(1500);
+
+      await this.state.updateStepStatus(taskId, nextStep.id, "done", {
+        status: "success",
+        extracted: { info: "搜索完成" },
+        summary: nextStep.description,
+      });
+      this.socketManager.emitStepCompleted(taskId, nextStep.id, nextStep.description);
+      await this.executeNextStep(taskId);
+    } else if (nextStep.type === "notification") {
+      await this.delay(500);
+
+      await this.state.updateStepStatus(taskId, nextStep.id, "done", {
+        status: "success",
+        extracted: {},
+        summary: nextStep.description,
+      });
+      this.socketManager.emitStepCompleted(taskId, nextStep.id, nextStep.description);
+      await this.executeNextStep(taskId);
+    } else {
+      // Fallback
+      await this.state.updateStepStatus(taskId, nextStep.id, "done", {
+        status: "success",
+        extracted: {},
+        summary: nextStep.description,
+      });
+      this.socketManager.emitStepCompleted(taskId, nextStep.id, nextStep.description);
       await this.executeNextStep(taskId);
     }
   }
@@ -191,18 +339,15 @@ export class Orchestrator {
 
     const { task, step: activeStep } = found;
 
-    // Store message
     message.taskId = task.id;
     message.stepId = activeStep.id;
     await this.state.associateMessage(message, task.id, activeStep.id);
 
-    // Notify frontend
     this.socketManager.emitReplyReceived(task.id, activeStep.id, {
       from: message.from,
       message: message.content.body,
     });
 
-    // Process reply
     const context = this.buildContext(task);
     const stepData = {
       id: activeStep.id,
@@ -223,14 +368,10 @@ export class Orchestrator {
 
       this.socketManager.emitStepCompleted(task.id, activeStep.id, result.summary);
 
-      // Check if replan is needed
       const taskFull = await this.state.getTask(task.id);
       const completedSteps = taskFull.steps
         .filter((s) => s.status === "done")
-        .map((s) => ({
-          description: s.description,
-          result: s.result as any,
-        }));
+        .map((s) => ({ description: s.description, result: s.result as any }));
       const remainingSteps = taskFull.steps
         .filter((s) => s.status === "pending")
         .map((s) => ({
@@ -257,18 +398,13 @@ export class Orchestrator {
         }
       }
 
-      // Continue
       await this.state.updateTaskStatus(task.id, "executing");
       await this.executeNextStep(task.id);
     } else if (result.status === "needs_user_input") {
       await this.state.updateStepStatus(task.id, activeStep.id, "waiting_user");
       await this.state.updateTaskStatus(task.id, "waiting_user");
 
-      const escalation = this.router.routeEscalation(
-        stepData,
-        context,
-        result.summary
-      );
+      const escalation = this.router.routeEscalation(stepData, context, result.summary);
 
       this.socketManager.emitNeedDecision(task.id, activeStep.id, {
         question: escalation.userPrompt!.question,
@@ -305,7 +441,7 @@ export class Orchestrator {
   ): Promise<ContactInfo[]> {
     const allContacts = await this.state.getContacts(userId);
 
-    return allContacts
+    const matched = allContacts
       .filter((c) => instruction.includes(c.name))
       .map((c) => ({
         id: c.id,
@@ -318,6 +454,32 @@ export class Orchestrator {
         },
         preferred: c.preferred as any,
       }));
+
+    // In demo mode, create virtual contacts if none found
+    if (matched.length === 0 && DemoSimulator.isDemoMode()) {
+      const names = ["张三", "李磊", "王磊", "李四", "王五"];
+      for (const name of names) {
+        if (instruction.includes(name)) {
+          matched.push({
+            id: `demo-${name}`,
+            name,
+            channels: { sms: "+8613800000001", voice: undefined, telegram: undefined, email: undefined },
+            preferred: "sms",
+          });
+        }
+      }
+      // Fallback for group notifications
+      if (matched.length === 0 && instruction.match(/小组|团队|项目组/)) {
+        matched.push({
+          id: "demo-group",
+          name: "小组成员",
+          channels: { sms: "+8613800000099", voice: undefined, telegram: undefined, email: undefined },
+          preferred: "sms",
+        });
+      }
+    }
+
+    return matched;
   }
 
   private resolveTargetNumber(context: TaskContext, targetName: string): string {
@@ -352,10 +514,7 @@ export class Orchestrator {
     const steps = task.steps || [];
     const results = steps
       .filter((s: any) => s.status === "done" && s.result)
-      .map((s: any) => ({
-        description: s.description,
-        result: s.result,
-      }));
+      .map((s: any) => ({ description: s.description, result: s.result }));
 
     return {
       instruction: task.instruction,
@@ -364,5 +523,9 @@ export class Orchestrator {
       results,
       context,
     };
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
