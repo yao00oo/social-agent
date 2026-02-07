@@ -3,6 +3,7 @@ dotenv.config();
 
 import express from "express";
 import cors from "cors";
+import path from "path";
 import { createServer } from "http";
 import { PrismaClient } from "@prisma/client";
 
@@ -28,9 +29,13 @@ async function main() {
   const httpServer = createServer(app);
 
   // Middleware
-  app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:5173" }));
+  app.use(cors({ origin: "*" }));
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
+
+  // Serve frontend static files (built with `vite build`)
+  const webDistPath = path.resolve(__dirname, "../../web/dist");
+  app.use(express.static(webDistPath));
 
   // Initialize modules
   const socketManager = new SocketManager(httpServer);
@@ -151,6 +156,11 @@ async function main() {
   // Health check
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  // SPA fallback: serve index.html for any non-API route
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(webDistPath, "index.html"));
   });
 
   // Start server
