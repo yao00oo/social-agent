@@ -1,0 +1,65 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Task {
+  id          String    @id @default(uuid())
+  userId      String
+  instruction String
+  status      String    // created|planning|executing|waiting_user|waiting_reply|completed|failed
+  context     Json      @default("{}")
+  steps       Step[]
+  messages    Message[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Step {
+  id          String    @id @default(uuid())
+  taskId      String
+  task        Task      @relation(fields: [taskId], references: [id])
+  type        String    // contact_outreach|user_decision|info_retrieval|phone_call|notification
+  description String
+  target      String?
+  channel     String?
+  goal        String?
+  options     Json?     // string[] for user_decision options
+  dependsOn   Json?     // string[] of step IDs
+  status      String    // pending|executing|waiting_response|waiting_user|done|failed
+  result      Json?
+  order       Int
+  messages    Message[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id])
+  stepId    String?
+  step      Step?    @relation(fields: [stepId], references: [id])
+  direction String   // inbound|outbound
+  channel   String
+  from      String
+  to        String
+  body      String
+  timestamp DateTime @default(now())
+}
+
+model Contact {
+  id        String  @id @default(uuid())
+  userId    String
+  name      String
+  relation  String? // 家人|朋友|同事|客户
+  sms       String?
+  voice     String?
+  telegram  String?
+  email     String?
+  preferred String  @default("sms")
+}

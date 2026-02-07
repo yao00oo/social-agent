@@ -1,0 +1,17 @@
+{
+  "name": "social-agent",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace=packages/server",
+    "dev:web": "npm run dev --workspace=packages/web",
+    "build:server": "npm run build --workspace=packages/server",
+    "build:web": "npm run build --workspace=packages/web",
+    "db:generate": "npm run db:generate --workspace=packages/server",
+    "db:migrate": "npm run db:migrate --workspace=packages/server",
+    "db:push": "npm run db:push --workspace=packages/server"
+  }
+}
