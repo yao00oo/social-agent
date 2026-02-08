@@ -15,6 +15,11 @@ import { DecisionRouter } from "./router/DecisionRouter";
 import { ChannelGateway } from "./gateway/ChannelGateway";
 import { TaskStateManager } from "./state/TaskStateManager";
 import { createWebhookRouter } from "./gateway/webhooks";
+import { GoalAnalyzer } from "./planner/GoalAnalyzer";
+import { SlotExtractor } from "./planner/SlotExtractor";
+import { MessageComposer } from "./planner/MessageComposer";
+import { ConversationLoop } from "./engine/ConversationLoop";
+import { ConversationEvaluator } from "./planner/ConversationEvaluator";
 
 const PORT = parseInt(process.env.PORT || "3001", 10);
 
@@ -45,13 +50,29 @@ async function main() {
   const router = new DecisionRouter();
   const state = new TaskStateManager(prisma);
 
+  // Initialize Goal + Slots engine components
+  const goalAnalyzer = new GoalAnalyzer();
+  const slotExtractor = new SlotExtractor();
+  const messageComposer = new MessageComposer();
+  const conversationEvaluator = new ConversationEvaluator();
+  const conversationLoop = new ConversationLoop(
+    conversationEvaluator,
+    slotExtractor,
+    messageComposer,
+    state,
+    gateway,
+    socketManager
+  );
+
   const orchestrator = new Orchestrator(
     planner,
     executor,
     router,
     gateway,
     state,
-    socketManager
+    socketManager,
+    goalAnalyzer,
+    conversationLoop
   );
 
   // ===== REST API routes =====

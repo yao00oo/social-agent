@@ -2,6 +2,19 @@ import { PrismaClient } from "@prisma/client";
 import { EventEmitter } from "events";
 import { TaskStep, StepResult, StepStatus, TaskStatus, UnifiedMessage, Channel } from "../types";
 
+/**
+ * Strip a phone number to digits only for comparison.
+ * This handles +14155551234 vs 14155551234 mismatches.
+ */
+function phoneDigits(phone: string): string {
+  return phone.replace(/\D/g, "");
+}
+
+function phonesMatch(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  return phoneDigits(a) === phoneDigits(b);
+}
+
 export interface StateChangeEvent {
   type: string;
   taskId: string;
@@ -147,6 +160,7 @@ export class TaskStateManager extends EventEmitter {
     channel: Channel
   ): Promise<{ task: any; step: any } | null> {
     // Find an active step that's waiting for a response from this number
+    // Order by task creation time desc so the newest task is matched first
     const activeSteps = await this.prisma.step.findMany({
       where: {
         status: "waiting_response",
@@ -161,12 +175,15 @@ export class TaskStateManager extends EventEmitter {
           take: 1,
         },
       },
+      orderBy: {
+        task: { createdAt: "desc" },
+      },
     });
 
-    // Match by the outbound message 'to' field
+    // Match by the outbound message 'to' field (normalize phone numbers)
     for (const step of activeSteps) {
       const lastOutbound = step.messages.find((m) => m.direction === "outbound");
-      if (lastOutbound && lastOutbound.to === from) {
+      if (lastOutbound && phonesMatch(lastOutbound.to, from)) {
         return { task: step.task, step };
       }
     }
@@ -182,13 +199,17 @@ export class TaskStateManager extends EventEmitter {
           where: { status: "waiting_response" },
         },
       },
+      orderBy: { createdAt: "desc" },
     });
 
     for (const task of activeTasks) {
       const context = task.context as any;
       if (context?.contacts) {
         for (const contact of context.contacts) {
-          if (contact.channels?.sms === from || contact.channels?.voice === from) {
+          if (
+            phonesMatch(contact.channels?.sms || "", from) ||
+            phonesMatch(contact.channels?.voice || "", from)
+          ) {
             const waitingStep = task.steps[0];
             if (waitingStep) {
               return { task, step: waitingStep };

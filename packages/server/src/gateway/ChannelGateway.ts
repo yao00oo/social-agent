@@ -39,7 +39,7 @@ export class ChannelGateway {
         if (!phone) {
           return { success: false, error: `No phone number for contact ${contact.name}` };
         }
-        return this.smsProvider.send(phone, message);
+        return this.voiceProvider.send(phone, message);
       }
       default:
         return { success: false, error: `Channel ${channel} not yet supported` };

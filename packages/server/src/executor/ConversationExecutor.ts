@@ -35,12 +35,13 @@ export class ConversationExecutor {
   async handleReply(
     message: UnifiedMessage,
     step: TaskStep,
-    context: TaskContext
+    context: TaskContext,
+    messageHistory?: Array<{ direction: string; body: string }>
   ): Promise<StepResult> {
     if (message.channel === "voice") {
       return this.voiceExecutor.handleReply(message, step, context);
     }
 
-    return this.textExecutor.handleReply(message, step, context);
+    return this.textExecutor.handleReply(message, step, context, messageHistory);
   }
 }

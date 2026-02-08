@@ -4,19 +4,29 @@ import { ConversationExecutor } from "./executor/ConversationExecutor";
 import { DecisionRouter } from "./router/DecisionRouter";
 import { ChannelGateway } from "./gateway/ChannelGateway";
 import { TaskStateManager } from "./state/TaskStateManager";
-import { TaskContext, UnifiedMessage, ContactInfo } from "./types";
+import { TaskContext, UnifiedMessage, ContactInfo, GoalContext } from "./types";
 import { SocketManager } from "./socket";
 import { DemoSimulator } from "./demo/DemoSimulator";
+import { GoalAnalyzer } from "./planner/GoalAnalyzer";
+import { ConversationLoop } from "./engine/ConversationLoop";
 
 export class Orchestrator {
+  private goalAnalyzer?: GoalAnalyzer;
+  private conversationLoop?: ConversationLoop;
+
   constructor(
     private planner: TaskPlanner,
     private executor: ConversationExecutor,
     private router: DecisionRouter,
     private gateway: ChannelGateway,
     private state: TaskStateManager,
-    private socketManager: SocketManager
+    private socketManager: SocketManager,
+    goalAnalyzer?: GoalAnalyzer,
+    conversationLoop?: ConversationLoop
   ) {
+    this.goalAnalyzer = goalAnalyzer;
+    this.conversationLoop = conversationLoop;
+
     // Listen for state changes and forward to socket
     this.state.on("stateChange", (event) => {
       this.socketManager.broadcastStateChange(event);
@@ -33,32 +43,97 @@ export class Orchestrator {
     // 3. Look up contacts mentioned in instruction
     const contacts = await this.resolveContacts(userId, instruction);
 
-    // 4. Plan the task (demo mode uses scripted plans)
-    let steps;
+    // --- Demo mode: always use old flow ---
     if (DemoSimulator.isDemoMode()) {
       console.log("[Demo] Using demo simulator for planning");
-      steps = DemoSimulator.generatePlan(instruction);
+      const steps = DemoSimulator.generatePlan(instruction);
+      if (steps) {
+        await this.state.addSteps(task.id, steps);
+        await this.state.updateTaskContext(task.id, { contacts, instruction });
+        await this.state.updateTaskStatus(task.id, "executing");
+        await this.executeNextStep(task.id);
+        return task;
+      }
     }
 
-    if (!steps) {
-      const plan = await this.planner.plan(
-        instruction,
-        userId,
-        contacts.map((c) => c.name)
-      );
-      steps = plan.steps;
+    // --- New Goal + Slots flow ---
+    if (this.goalAnalyzer && this.conversationLoop) {
+      try {
+        console.log("[Orchestrator] Using Goal+Slots engine");
+
+        const analysis = await this.goalAnalyzer.analyze(instruction, contacts);
+
+        // Build GoalContext
+        const goalContext: GoalContext = {
+          goal: {
+            type: analysis.goalType,
+            description: analysis.goalDescription,
+            originalInstruction: instruction,
+          },
+          slots: analysis.slots.map((s) => ({
+            key: s.key,
+            description: s.description,
+            required: s.required,
+            source: s.source,
+            confirmWithUser: s.confirmWithUser,
+            value: s.value,
+            confirmed: s.value !== undefined ? !s.confirmWithUser : undefined,
+            filledBy: s.value !== undefined ? "context" : undefined,
+            extractionHint: s.extractionHint,
+          })),
+          parties: analysis.parties.map((p) => {
+            const contact = contacts.find(
+              (c) => c.name.toLowerCase() === p.name.toLowerCase()
+            );
+            return {
+              name: p.name,
+              role: p.role,
+              contactId: contact?.id,
+              channel: contact?.preferred,
+              channelAddress: contact
+                ? contact.channels[contact.preferred] ||
+                  contact.channels.sms
+                : undefined,
+            };
+          }),
+          conversationPhase: "gathering",
+          pendingConfirmations: [],
+          postActions: analysis.postActions,
+          activeConversations: {},
+        };
+
+        // Store context
+        await this.state.updateTaskContext(task.id, {
+          contacts,
+          instruction,
+          goalContext,
+        });
+
+        await this.state.updateTaskStatus(task.id, "executing");
+
+        // Start conversation loop
+        await this.conversationLoop.advance(task.id);
+
+        return task;
+      } catch (error) {
+        console.error(
+          "[Orchestrator] Goal+Slots engine failed, falling back to old flow:",
+          error
+        );
+        // Fall through to old flow
+      }
     }
 
-    // 5. Store steps
-    await this.state.addSteps(task.id, steps);
+    // --- Fallback: old TaskPlanner flow ---
+    const plan = await this.planner.plan(
+      instruction,
+      userId,
+      contacts.map((c) => c.name)
+    );
 
-    // 6. Store contacts in task context
+    await this.state.addSteps(task.id, plan.steps);
     await this.state.updateTaskContext(task.id, { contacts, instruction });
-
-    // 7. Update status and start execution
     await this.state.updateTaskStatus(task.id, "executing");
-
-    // 8. Execute first step
     await this.executeNextStep(task.id);
 
     return task;
@@ -348,6 +423,19 @@ export class Orchestrator {
       message: message.content.body,
     });
 
+    // --- Check if this task uses the new Goal+Slots engine ---
+    const taskContext = (task.context as Record<string, any>) || {};
+    if (taskContext.goalContext && this.conversationLoop) {
+      console.log("[Orchestrator] Routing inbound message to ConversationLoop");
+      await this.conversationLoop.handleContactReply(
+        task.id,
+        message,
+        activeStep.id
+      );
+      return;
+    }
+
+    // --- Old flow ---
     const context = this.buildContext(task);
     const stepData = {
       id: activeStep.id,
@@ -360,7 +448,44 @@ export class Orchestrator {
       order: activeStep.order,
     };
 
-    const result = await this.executor.handleReply(message, stepData, context);
+    // Fetch real message history for this step
+    const stepMessages = await this.state.getStepMessages(activeStep.id);
+    const messageHistory = stepMessages.map((m) => ({
+      direction: m.direction,
+      body: m.body,
+    }));
+
+    const result = await this.executor.handleReply(message, stepData, context, messageHistory);
+
+    // Check if this is a "continue conversation" result (agent sent follow-up, waiting for next reply)
+    if (result.status === "success" && result.extracted?._continueConversation) {
+      // Agent sent a follow-up message, keep step in waiting_response state
+      const followUp = result.extracted._followUpSent;
+      if (followUp) {
+        // Store the follow-up as an outbound message
+        const followUpMsg: UnifiedMessage = {
+          id: uuid(),
+          taskId: task.id,
+          stepId: activeStep.id,
+          direction: "outbound",
+          channel: (activeStep.channel as any) || "sms",
+          from: process.env.TWILIO_PHONE_NUMBER || "agent",
+          to: message.from,
+          content: { type: "text", body: followUp },
+          timestamp: new Date(),
+        };
+        await this.state.associateMessage(followUpMsg, task.id, activeStep.id);
+
+        this.socketManager.emitMessageSent(task.id, activeStep.id, {
+          message: followUp,
+          to: stepData.target || "",
+        });
+      }
+      // Keep waiting for the next reply
+      await this.state.updateStepStatus(task.id, activeStep.id, "waiting_response");
+      await this.state.updateTaskStatus(task.id, "waiting_reply");
+      return;
+    }
 
     if (result.status === "success") {
       await this.state.updateStepStatus(task.id, activeStep.id, "done", result);
@@ -419,6 +544,16 @@ export class Orchestrator {
   }
 
   async handleUserDecision(taskId: string, stepId: string, choice: string) {
+    // --- Check if this task uses the new Goal+Slots engine ---
+    const task = await this.state.getTask(taskId);
+    const taskContext = (task.context as Record<string, any>) || {};
+    if (taskContext.goalContext && this.conversationLoop) {
+      console.log("[Orchestrator] Routing user decision to ConversationLoop");
+      await this.conversationLoop.handleUserDecision(taskId, stepId, choice);
+      return;
+    }
+
+    // --- Old flow ---
     await this.state.updateStepStatus(taskId, stepId, "done", {
       status: "success",
       extracted: { user_choice: choice },
@@ -442,7 +577,7 @@ export class Orchestrator {
     const allContacts = await this.state.getContacts(userId);
 
     const matched = allContacts
-      .filter((c) => instruction.includes(c.name))
+      .filter((c) => instruction.toLowerCase().includes(c.name.toLowerCase()))
       .map((c) => ({
         id: c.id,
         name: c.name,

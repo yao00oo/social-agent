@@ -1,6 +1,9 @@
 import { Router, Request, Response } from "express";
 import { v4 as uuid } from "uuid";
+import Twilio from "twilio";
 import { UnifiedMessage } from "../types";
+
+const { validateRequest } = Twilio;
 
 export type InboundMessageHandler = (message: UnifiedMessage) => Promise<void>;
 
@@ -10,9 +13,27 @@ export function createWebhookRouter(onMessage: InboundMessageHandler): Router {
   // Twilio SMS webhook
   router.post("/twilio/sms", async (req: Request, res: Response) => {
     try {
+      // Verify Twilio signature (skip if no auth token = mock mode)
+      const authToken = process.env.TWILIO_AUTH_TOKEN;
+      if (authToken) {
+        const signature = req.headers["x-twilio-signature"] as string;
+        const webhookBase = process.env.WEBHOOK_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
+        const url = `${webhookBase}/webhook/twilio/sms`;
+
+        if (!signature || !validateRequest(authToken, signature, url, req.body)) {
+          console.warn("[Webhook] Invalid Twilio signature — rejecting request");
+          return res.status(403).send("Forbidden");
+        }
+      }
+
       const { From, To, Body, MessageSid } = req.body;
 
-      console.log(`[Webhook] SMS from ${From}: ${Body}`);
+      // Strip "whatsapp:" prefix for phone number matching
+      const cleanFrom = From?.replace("whatsapp:", "") || "";
+      const cleanTo = To?.replace("whatsapp:", "") || "";
+      const isWhatsApp = From?.startsWith("whatsapp:");
+
+      console.log(`[Webhook] ${isWhatsApp ? "WhatsApp" : "SMS"} from ${cleanFrom}: ${Body}`);
 
       const message: UnifiedMessage = {
         id: MessageSid || uuid(),
@@ -20,8 +41,8 @@ export function createWebhookRouter(onMessage: InboundMessageHandler): Router {
         stepId: "", // will be resolved by orchestrator
         direction: "inbound",
         channel: "sms",
-        from: From,
-        to: To,
+        from: cleanFrom,
+        to: cleanTo,
         content: {
           type: "text",
           body: Body,

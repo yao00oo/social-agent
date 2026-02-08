@@ -153,3 +153,136 @@ export interface ReplyAnalysis {
   next_action: "reply" | "escalate" | "end";
   suggested_reply?: string;
 }
+
+// ===== Goal + Slots Engine Types =====
+
+export type GoalType =
+  | "scheduling"
+  | "notification"
+  | "inquiry"
+  | "introduction"
+  | "consultation"
+  | "custom";
+
+export type SlotSource =
+  | "user_preference"
+  | "contact_negotiate"
+  | "agent_decide"
+  | "context";
+
+export type ConversationPhase =
+  | "analyzing"
+  | "gathering"
+  | "confirming"
+  | "executing_post"
+  | "completed"
+  | "failed";
+
+export type Sentiment =
+  | "positive"
+  | "neutral"
+  | "hesitant"
+  | "negative"
+  | "rejection";
+
+export type NextAction =
+  | "message_contact"
+  | "ask_user"
+  | "auto_decide"
+  | "handle_rejection"
+  | "send_final_confirmation"
+  | "goal_achieved"
+  | "goal_failed";
+
+export interface EvaluationResult {
+  sentiment: Sentiment;
+  goalAchieved: boolean;
+  goalAchievedReason: string;
+  nextAction: NextAction;
+  nextActionReason: string;
+  messageHint?: string;
+  userQuestion?: string;
+  userOptions?: string[];
+  slotUpdates: Array<{ key: string; value: any; source: string }>;
+  newRequirements?: string[];
+}
+
+export interface SlotDefinition {
+  key: string;
+  description: string;
+  required: boolean;
+  source: SlotSource;
+  confirmWithUser: boolean;
+  value?: any;
+  confirmed?: boolean;
+  filledBy?: string;
+  extractionHint?: string;
+}
+
+export interface GoalContext {
+  goal: {
+    type: GoalType;
+    description: string;
+    originalInstruction: string;
+  };
+  slots: SlotDefinition[];
+  parties: Array<{
+    name: string;
+    role: "initiator" | "target";
+    contactId?: string;
+    channel?: Channel;
+    channelAddress?: string;
+  }>;
+  /** @deprecated Kept for backwards compat; ReAct loop uses EvaluationResult.nextAction instead */
+  conversationPhase: ConversationPhase;
+  pendingConfirmations: string[];
+  postActions: Array<{
+    type: string;
+    params: Record<string, any>;
+  }>;
+  activeConversations: Record<
+    string,
+    {
+      stepId: string;
+      targetName: string;
+      slotsBeingCollected: string[];
+      messageCount: number;
+      status: "active" | "completed" | "failed";
+    }
+  >;
+  /** Number of consecutive advance() calls in this task (safety counter) */
+  loopCount?: number;
+}
+
+export interface GoalAnalysisResult {
+  goalType: GoalType;
+  goalDescription: string;
+  slots: Array<{
+    key: string;
+    description: string;
+    required: boolean;
+    source: SlotSource;
+    confirmWithUser: boolean;
+    value?: any;
+    extractionHint?: string;
+  }>;
+  parties: Array<{
+    name: string;
+    role: "initiator" | "target";
+  }>;
+  postActions: Array<{
+    type: string;
+    params: Record<string, any>;
+  }>;
+}
+
+export interface SlotExtractionResult {
+  extracted: Array<{
+    key: string;
+    value: any;
+    confidence: number;
+  }>;
+  conversationDone: boolean;
+  needsFollowUp: boolean;
+  followUpReason?: string;
+}

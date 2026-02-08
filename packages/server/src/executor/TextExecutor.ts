@@ -39,12 +39,18 @@ export class TextExecutor {
   async handleReply(
     inboundMessage: UnifiedMessage,
     step: TaskStep,
-    context: TaskContext
+    context: TaskContext,
+    messageHistory?: Array<{ direction: string; body: string }>
   ): Promise<StepResult> {
     const replyText = inboundMessage.content.body;
 
-    // Analyze the reply
-    const analysis = await this.analyzeReply(step, context, replyText);
+    // Build conversation history string from real messages
+    const historyStr = this.formatHistory(messageHistory || [], replyText);
+
+    // Analyze the reply with real history
+    const analysis = await this.analyzeReply(step, context, replyText, historyStr);
+
+    console.log(`[TextExecutor] Reply analysis: intent=${analysis.intent}, goal_achieved=${analysis.goal_achieved}, next_action=${analysis.next_action}`);
 
     if (analysis.goal_achieved) {
       return {
@@ -72,11 +78,21 @@ export class TextExecutor {
         await this.gateway.send(targetContact, analysis.suggested_reply, step.channel);
       }
 
-      // Still waiting for response
+      // Return a special status so orchestrator knows to keep waiting
+      // instead of escalating to user
       return {
-        status: "needs_user_input",
-        extracted: analysis.extracted_data,
+        status: "success" as any,
+        extracted: { ...analysis.extracted_data, _continueConversation: true, _followUpSent: analysis.suggested_reply },
         summary: `继续与 ${step.target} 沟通中`,
+      };
+    }
+
+    // "end" action — conversation ended without achieving goal
+    if (analysis.next_action === "end") {
+      return {
+        status: "success",
+        extracted: analysis.extracted_data,
+        summary: `与 ${step.target} 的对话结束: ${replyText}`,
       };
     }
 
@@ -85,6 +101,27 @@ export class TextExecutor {
       extracted: {},
       summary: `与 ${step.target} 的沟通未能达成目标`,
     };
+  }
+
+  private formatHistory(
+    messages: Array<{ direction: string; body: string }>,
+    currentReply: string
+  ): string {
+    if (messages.length === 0) {
+      return `对方回复: ${currentReply}`;
+    }
+
+    const lines = messages.map((m) => {
+      const role = m.direction === "outbound" ? "助理" : "对方";
+      return `${role}: ${m.body}`;
+    });
+    // The current reply is already in messages (added by orchestrator before calling),
+    // but include it explicitly if not present
+    const lastMsg = messages[messages.length - 1];
+    if (!lastMsg || lastMsg.body !== currentReply) {
+      lines.push(`对方: ${currentReply}`);
+    }
+    return lines.join("\n");
   }
 
   private async generateMessage(
@@ -110,11 +147,12 @@ export class TextExecutor {
   private async analyzeReply(
     step: TaskStep,
     context: TaskContext,
-    reply: string
+    reply: string,
+    historyStr: string
   ): Promise<ReplyAnalysis> {
     const prompt = REPLY_ANALYSIS_PROMPT
       .replace("{goal}", step.goal || step.description)
-      .replace("{history}", "（对话进行中）")
+      .replace("{history}", historyStr)
       .replace("{reply}", reply);
 
     try {
